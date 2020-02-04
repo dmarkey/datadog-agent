@@ -31,6 +31,7 @@ const (
 // KubeEndpointsListener listens to kubernetes endpoints creation
 type KubeEndpointsListener struct {
 	endpointsInformer infov1.EndpointsInformer
+	serviceInformer   infov1.ServicesInformer
 	serviceLister     listv1.ServiceLister
 	endpoints         map[types.UID][]*KubeEndpointService
 	newService        chan<- Service
@@ -70,6 +71,8 @@ func NewKubeEndpointsListener() (ServiceListener, error) {
 	return &KubeEndpointsListener{
 		endpoints:         make(map[types.UID][]*KubeEndpointService),
 		endpointsInformer: endpointsInformer,
+		endpointsLister:   endpointsInformer.Lister(),
+		serviceInformer:   serviceInformer,
 		serviceLister:     serviceInformer.Lister(),
 	}, nil
 }
@@ -80,13 +83,18 @@ func (l *KubeEndpointsListener) Listen(newSvc chan<- Service, delSvc chan<- Serv
 	l.delService = delSvc
 
 	l.endpointsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    l.added,
-		UpdateFunc: l.updated,
-		DeleteFunc: l.deleted,
+		AddFunc:    l.endpointsAdded,
+		DeleteFunc: l.endpointsDeleted,
+		UpdateFunc: l.endpointsUpdated,
+	})
+
+	l.serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    l.serviceAdded,
+		UpdateFunc: l.serviceUpdated,
 	})
 
 	// Initial fill
-	endpoints, err := l.endpointsInformer.Lister().List(labels.Everything())
+	endpoints, err := l.endpointsLister.List(labels.Everything())
 	if err != nil {
 		log.Errorf("Cannot list Kubernetes endpoints: %s", err)
 	}
@@ -100,7 +108,7 @@ func (l *KubeEndpointsListener) Stop() {
 	// We cannot deregister from the informer
 }
 
-func (l *KubeEndpointsListener) added(obj interface{}) {
+func (l *KubeEndpointsListener) endpointsAdded(obj interface{}) {
 	castedObj, ok := obj.(*v1.Endpoints)
 	if !ok {
 		log.Errorf("Expected an Endpoints type, got: %v", obj)
@@ -109,7 +117,7 @@ func (l *KubeEndpointsListener) added(obj interface{}) {
 	l.createService(castedObj, false)
 }
 
-func (l *KubeEndpointsListener) deleted(obj interface{}) {
+func (l *KubeEndpointsListener) endpointsDeleted(obj interface{}) {
 	castedObj, ok := obj.(*v1.Endpoints)
 	if !ok {
 		log.Errorf("Expected an Endpoints type, got: %v", obj)
@@ -118,7 +126,7 @@ func (l *KubeEndpointsListener) deleted(obj interface{}) {
 	l.removeService(castedObj)
 }
 
-func (l *KubeEndpointsListener) updated(old, obj interface{}) {
+func (l *KubeEndpointsListener) endpointsUpdated(old, obj interface{}) {
 	// Cast the updated object or return on failure
 	castedObj, ok := obj.(*v1.Endpoints)
 	if !ok {
@@ -136,6 +144,53 @@ func (l *KubeEndpointsListener) updated(old, obj interface{}) {
 		l.removeService(castedObj)
 		l.createService(castedObj, false)
 	}
+}
+
+func (l *KubeEndpointsListener) serviceAdded(obj interface{}) {
+	castedObj, ok := obj.(*v1.Service)
+	if !ok {
+		log.Errorf("Expected a Service type, got: %v", obj)
+		return
+	}
+
+	if !isServiceAnnotated(castedObj) {
+		return
+	}
+
+	l.createService(l.endpointsForService(castedObj), false)
+}
+
+func (l *KubeEndpointsListener) serviceUpdated(old, obj interface{}) {
+	// Cast the updated object or return on failure
+	castedObj, ok := obj.(*v1.Service)
+	if !ok {
+		log.Errorf("Expected a Service type, got: %v", obj)
+		return
+	}
+
+	// Cast the old object, consider it an add on cast failure
+	castedOld, ok := old.(*v1.Endpoints)
+	if !ok {
+		log.Errorf("Expected a Service type, got: %v", old)
+		l.createService(l.endpointsForService(castedObj), false)
+		return
+	}
+
+	if isServiceAnnotated(castedOld) != isServiceAnnotated(castedObj) {
+		kendpoints := l.endpointsForService(castedObj)
+		l.removeService(kendpoints)
+		l.createService(kendpoints, false)
+	}
+}
+
+func (l *KubeEndpointsListener) endpointsForService(service *v1.Service) *v1.Endpoints {
+	kendpoints, err := l.endpointsLister.Endpoints(service.Namespace).Get(service.Name)
+	if err != nil {
+		log.Warnf("Cannot get Kubernetes endpoints - Endpoints services won't be created - error: %s", err)
+		return nil, err
+	}
+
+	return kendpoints
 }
 
 // endpointsDiffer compares two endpoints to only go forward
